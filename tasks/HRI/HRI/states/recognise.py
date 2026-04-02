@@ -1,0 +1,251 @@
+from typing import List, Dict, Optional
+
+import rclpy
+from rclpy.node import Node
+import numpy as np
+import message_filters
+import cv2
+
+from smach import UserData
+from smach_ros import RosState
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image, CameraInfo
+
+from lasr_vision_msgs.msg import Detection3D
+from lasr_vision_msgs.srv import Recognise3D, YoloDetection3D
+
+class Recognise(RosState):
+
+    _rgb_image: Image
+    _depth_image: Image
+    _depth_camera_info: CameraInfo
+    _rgb_image_topic: str
+    _depth_image_topic: str
+    _depth_info_topic: str
+    _bridge: CvBridge
+    _can_detect_second_guest: bool = False
+
+    def __init__(self, node: Node, can_detect_second_guest: bool = False):
+        super().__init__(node,
+            outcomes=["succeeded", "failed"],
+            input_keys=["guest_data", "guest_seat_point", "seated_guest_locs"],
+            output_keys=["named_guest_detection", "guest_data"],
+        )
+        self._rgb_image = None
+        self._depth_image = None
+        self._depth_camera_info = None
+
+        self._rgb_image_topic = "/xtion/rgb/image_raw"
+        self._depth_image_topic = "/xtion/depth_registered/image_raw"
+        self._depth_info_topic = "/xtion/depth_registered/camera_info"
+
+        self._can_detect_second_guest = can_detect_second_guest
+
+        self._bridge = CvBridge()
+
+    def _handle_no_detections(self, guest_data: Dict) -> Detection3D:
+        """
+        Handles the case where no detections are made, by checking which guests
+        (if any) have already been detected in the sweep. If no guests have been
+        detected yet, we assume that we are looking at the host.
+        """
+        for guest_id, data in guest_data.items():
+            if data["seating_detection"]:
+                continue
+            if guest_id == "guest2" and not self._can_detect_second_guest:
+                continue
+            detection = Detection3D()
+            detection.name = guest_id
+            guest_data[guest_id]["seating_detection"] = True
+            return detection
+
+    def _crop_image(
+        self, person_detections: List[Detection3D], rgb_image: Image
+    ) -> Tuple[Image, Image]:
+        """Crops the RGB and depth images to the most centred person in the detections, This is
+        to handle the case where multiple people are detected, so that when we pass to the
+        REID service, we only detect the nearest person.
+
+        Args:
+            person_detections (List[Detection3D]): List of person detections
+            returned by the YOLO service call.
+
+            rgb_image (Image): Raw RGB image that the detection was made on.
+
+            depth_image (Image): Raw depth image that the detection was made on.
+
+        Returns:
+            Tuple[Image, Image]: A tuple containing the cropped RGB and depth images.
+        """
+        image_width, image_height = rgb_image.width, rgb_image.height
+        centre_x = image_width // 2
+        centre_y = image_height // 2
+        closest_distance = float("inf")
+        closest_detection = None
+        for detection in person_detections:
+            if detection.name != "person":
+                raise ValueError(
+                    f"Somehow a non-person detection was passed to the cropping function: {detection.name}"
+                )
+            x, y, w, h = detection.xywh
+            # Find the centre of the bounding box
+            bbox_centre_x = x + w // 2
+            bbox_centre_y = y + h // 2
+
+            distance_to_centre = np.abs(bbox_centre_x - centre_x) + np.abs(
+                bbox_centre_y - centre_y
+            )
+            if distance_to_centre < closest_distance:
+                closest_distance = distance_to_centre
+                closest_detection = detection
+
+        assert closest_detection is not None, "No person detection found to crop."
+
+        # Crop the images using the segmentation mask of the closest detection.
+        seg_mask = closest_detection.xyseg  # Binary mask
+
+        rgb_image_raw = self._bridge.imgmsg_to_cv2(rgb_image, desired_encoding="rgb8")
+        # Taken from https://stackoverflow.com/questions/37912928/fill-the-outside-of-contours-opencv
+        mask = np.array(seg_mask).reshape(-1, 2)
+        stencil = np.zeros(rgb_image_raw.shape).astype(rgb_image_raw.dtype)
+        colour = (255, 255, 255)
+        cv2.fillPoly(stencil, [mask], colour)
+        # Bitwise AND with 0s is 0s, hence we get the image only where the mask is
+        # with black elsewhere.
+        masked_image = cv2.bitwise_and(rgb_image_raw, stencil)
+
+        # Convert back to ROS Image message
+        return self._bridge.cv2_to_imgmsg(masked_image, encoding="rgb8")
+
+    def execute(self, userdata: UserData) -> str:
+
+        recognise = self._node.create_client(
+            Recognise3D, "/lasr_vision_reid/recognise"
+        )
+        yolo_detection = self._node.create_client(YoloDetection3D, "/yolo/detect3d")
+
+        if not recognise.wait_for_service(timeout_sec=5.0):
+            self._node.get_logger().error(
+                "Recognise3D service /lasr_vision_reid/recognise not available"
+            )
+            return "failed"
+        if not yolo_detection.wait_for_service(timeout_sec=5.0):
+            self._node.get_logger().error(
+                "YoloDetection3D service /yolo/detect3d not available"
+            )
+            return "failed"
+
+        self._rgb_image = None
+        self._depth_image = None
+        self._depth_camera_info = None
+
+        def get_images_cb(
+            image: Image, depth_image: Image, depth_camera_info: CameraInfo
+        ) -> None:
+            self._rgb_image = image
+            self._depth_image = depth_image
+            self._depth_camera_info = depth_camera_info
+
+            if (
+                self._rgb_image is None
+                or self._depth_image is None
+                or self._depth_camera_info is None
+            ):
+                self._rgb_image = image
+                self._depth_image = depth_image
+                self._depth_camera_info = depth_camera_info
+
+        image_sub = message_filters.Subscriber(self._rgb_image_topic, Image)
+        depth_sub = message_filters.Subscriber(self._depth_image_topic, Image)
+        depth_camera_info_sub = message_filters.Subscriber(
+            self._depth_info_topic, CameraInfo
+        )
+        ts = message_filters.ApproximateTimeSynchronizer(
+            [image_sub, depth_sub, depth_camera_info_sub], 10, 2.0
+        )
+        ts.registerCallback(get_images_cb)
+
+        while (
+            self._rgb_image is None
+            or self._depth_image is None
+            or self._depth_camera_info is None
+        ):
+
+            rclpy.spin_once(self._node, timeout_sec=0.05)
+
+        yolo_request = YoloDetection3DRequest(
+            image_raw=self._rgb_image,
+            model="yolo11n-seg.pt",
+            depth_image=self._depth_image,
+            depth_camera_info=self._depth_camera_info,
+            filter=["person"],
+            target_frame="map",
+        )
+
+        yolo_future = yolo_client.call_async(yolo_request)
+        rclpy.spin_until_future_complete(self._node, yolo_future)
+        yolo_response = yolo_future.result()
+
+        # Service call failed entirely, no response to work with
+        if yolo_response is None:
+            self._node.get_logger().warn("YOLO detection service call failed.")
+            return "failed"
+
+        # Service succeeded but no people detected, fall back to undetected guest assignment
+        if len(yolo_response.detected_objects) == 0:
+            self._node.get_logger().warn("No persons detected by YOLO.")
+            userdata.named_guest_detection = self._handle_no_detections(
+                userdata.guest_data
+            )
+            return "succeeded"
+
+        cropped_rgb_image = self._crop_image(yolo_response.detected_objects, self._rgb_image)
+
+        request = Recognise3DRequest(
+            image_raw=cropped_rgb_image,
+            depth_image=self._depth_image,
+            depth_camera_info=self._depth_camera_info,
+            threshold=0.5,
+            target_frame="map",
+        )
+        try:
+            recognise_future = recognise.call_async(request)
+            rclpy.spin_until_future_complete(self._node, recognise_future)
+            response = recognise_future.result()
+
+            if response is None:
+                self._node.get_logger().warn("Recognise service call returned None.")
+                return "failed"
+
+            if len(response.detections) == 0:
+                self._node.get_logger().info(
+                    "No recognitions returned; falling back to _handle_no_detections."
+                )
+                named_guest_detection = self._handle_no_detections(userdata.guest_data)
+            else:
+                detection_id = response.detections[0].name
+                if userdata.guest_data[detection_id]["seating_detection"]:
+                    # We have already detected this guest in the seating area
+                    self._node.get_logger().info(
+                        f"Guest '{detection_id}' already detected; falling back."
+                    )
+                    named_guest_detection = self._handle_no_detections(
+                        userdata.guest_data
+                    )
+                else:
+                    named_guest_detection = response.detections[0]
+                    userdata.guest_data[named_guest_detection.name][
+                        "seating_detection"
+                    ] = True
+                    self._node.get_logger().info(
+                        f"Recognised guest: {named_guest_detection.name}"
+                    )
+
+            userdata.named_guest_detection = named_guest_detection
+
+
+        except Exception as e:
+            self._node.get_logger().warn(f"Unable to perform recognition: {str(e)}")
+            return "failed"
+
+        return "succeeded"

@@ -14,9 +14,6 @@ from HRI.states import *
 from shapely.geometry import Polygon
 from std_msgs.msg import Empty
 
-from Base.tasks.HRI.HRI.states.check_sofa import CheckSofa
-
-
 class HRI(smach.StateMachine):
     def __init__(self, node):
         smach.StateMachine.__init__(self, outcomes=["succeeded", "failed"])
@@ -88,7 +85,7 @@ class HRI(smach.StateMachine):
 
         smach.StateMachine.add(
             "INTRODUCE_GUESTS_TO_EACHOTHER",
-            IntroduceGuestsToEachother(node),
+            Introducer(node),
             transitions={
                 "valid": "ASK_SECOND_GUEST_FOR_BAG_TO_HOST",
                 "invalid": "INTRODUCE_GUESTS_TO_EACHOTHER",
