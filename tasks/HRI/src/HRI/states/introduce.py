@@ -9,11 +9,13 @@ from rclpy.node import Node
 from std_msgs.msg import Header
 from geometry_msgs.msg import PointStamped
 
-from lasr_skills import LookToPoint, Say, Wait
+from lasr_skills.look_to_point import LookToPoint
+from lasr_skills.say import Say
+from lasr_skills.wait import Wait
 
-from .clear_seating_detections import ClearSeatingDetections
-from .get_guest_data import GetGuestData
-from .get_introduction_str import GetIntroductionStr
+from .clearSeatingDetections import ClearSeatingDetections
+from .getGuestData import GetGuestData
+from .getIntroductionStr import GetIntroductionStr
 from .recognise import Recognise
 
 
@@ -112,18 +114,28 @@ class Introduce(smach.StateMachine):
                         },
                         remapping={"look_point": "pointstamped"},
                     )
+                    """
                     smach.StateMachine.add(
                         "LOOK_TO_GUEST_1",
-                        LookToPoint(),
+                        LookToPoint(node),
                         transitions={
                             "succeeded": "WAIT",
                             "aborted": "failed",
                             "timed_out": "failed",
                         },
                     )
+                    """
+                    smach.StateMachine.add(
+                        "LOOK_TO_GUEST_1",
+                        smach.CBState(
+                        lambda ud: "succeeded",
+                        outcomes=["succeeded"],
+                        ),
+                        transitions={"succeeded": "WAIT"},
+                    )
                     smach.StateMachine.add(
                         "WAIT",
-                        Wait(0.25),
+                        Wait(node, 0.25),
                         transitions={"succeeded": "RECOGNISE", "failed": "failed"},
                     )
                     smach.StateMachine.add(
@@ -163,7 +175,7 @@ class Introduce(smach.StateMachine):
                     )
                     smach.StateMachine.add(
                         "SAY_INTRODUCTION",
-                        Say(),
+                        Say(node),
                         transitions={
                             "succeeded": "LOOK_TO_GUEST_2",
                             "aborted": "failed",
@@ -173,7 +185,16 @@ class Introduce(smach.StateMachine):
                     )
                     smach.StateMachine.add(
                         "LOOK_TO_GUEST_2",
-                        LookToPoint(),
+                        smach.CBState(
+                        lambda ud: "succeeded",
+                        outcomes=["succeeded"],
+                        ),
+                        transitions={"succeeded": "GET_GUEST_DATA_2"},
+                    )
+                    """
+                    smach.StateMachine.add(
+                        "LOOK_TO_GUEST_2",
+                        LookToPoint(node),
                         transitions={
                             "succeeded": "GET_GUEST_DATA_2",
                             "aborted": "failed",
@@ -181,6 +202,7 @@ class Introduce(smach.StateMachine):
                         },
                         remapping={"pointstamped": "guest_seat_point"},
                     )
+                    """
                     smach.StateMachine.add(
                         "GET_GUEST_DATA_2",
                         GetGuestData(guest_to_introduce_to=self._guest_to_introduce),
@@ -204,7 +226,7 @@ class Introduce(smach.StateMachine):
                     )
                     smach.StateMachine.add(
                         "SAY_INTRODUCTION_2",
-                        Say(),
+                        Say(node),
                         transitions={
                             "succeeded": "continue",
                             "aborted": "failed",

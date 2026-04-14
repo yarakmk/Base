@@ -6,7 +6,7 @@ from geometry_msgs.msg import Point, PointStamped
 
 from std_msgs.msg import Header
 
-from receptionist.states.introduce import Introduce
+from HRI.states.introduce import Introduce
 
 
 def main():
@@ -50,7 +50,7 @@ def main():
 
         header=header,
 
-        point=Point(x=1.078, y=-0.384, z=1.5),
+        point=Point(x=0.406857, y=1.399995, z=1.5),
 
     )
 
@@ -60,7 +60,7 @@ def main():
 
     sm.userdata.seated_guest_locs = [
 
-        Point(x=0.979, y=0.689, z=1.5),  # host position
+        Point(x=0.9, y=0.2, z=1.5)
 
     ]
 

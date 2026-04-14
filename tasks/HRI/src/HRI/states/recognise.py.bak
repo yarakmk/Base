@@ -11,8 +11,8 @@ from smach_ros import RosState
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CameraInfo
 
-from lasr_vision_msgs.msg import Detection3D
-from lasr_vision_msgs.srv import Recognise3D, YoloDetection3D
+from lasr_vision_interfaces.msg import Detection3D
+from lasr_vision_interfaces.srv import Recognise3D, YoloDetection3D
 
 class Recognise(RosState):
 
@@ -35,9 +35,9 @@ class Recognise(RosState):
         self._depth_image = None
         self._depth_camera_info = None
 
-        self._rgb_image_topic = "/xtion/rgb/image_raw"
-        self._depth_image_topic = "/xtion/depth_registered/image_raw"
-        self._depth_info_topic = "/xtion/depth_registered/camera_info"
+        self._rgb_image_topic = "/head_front_camera/rgb/image_raw"
+        self._depth_image_topic = "/head_front_camera/depth/image_raw"
+        self._depth_info_topic = "/head_front_camera/depth/camera_info"
 
         self._can_detect_second_guest = can_detect_second_guest
 
@@ -61,7 +61,7 @@ class Recognise(RosState):
 
     def _crop_image(
         self, person_detections: List[Detection3D], rgb_image: Image
-    ) -> Tuple[Image, Image]:
+    ) -> tuple[Image, Image]:
         """Crops the RGB and depth images to the most centred person in the detections, This is
         to handle the case where multiple people are detected, so that when we pass to the
         REID service, we only detect the nearest person.
@@ -119,19 +119,57 @@ class Recognise(RosState):
 
     def execute(self, userdata: UserData) -> str:
 
-        recognise = self._node.create_client(
-            Recognise3D, "/lasr_vision_reid/recognise"
+        recognise = self.node.create_client(
+            Recognise3D, "/lasr_vision_reid/recognise/threed"
         )
-        yolo_detection = self._node.create_client(YoloDetection3D, "/yolo/detect3d")
+        yolo_detection = self.node.create_client(YoloDetection3D, "/yolo/detect3d")
 
         if not recognise.wait_for_service(timeout_sec=5.0):
-            self._node.get_logger().error(
-                "Recognise3D service /lasr_vision_reid/recognise not available"
-            )
+            self.node.get_logger().error(
+                "Recognise3D service /lasr_vision_reid/recognise not available")
             return "failed"
         if not yolo_detection.wait_for_service(timeout_sec=5.0):
-            self._node.get_logger().error(
-                "YoloDetection3D service /yolo/detect3d not available"
+            self.node.get_logger().error("YOLO detection service call failed.")
+            return "failed"
+
+        # Service succeeded but no people detected, fall back to undetected guest assignment
+        if len(yolo_response.detected_objects) == 0:
+            self.node.get_logger().warn("No persons detected by YOLO.")
+            userdata.named_guest_detection = self._handle_no_detections(
+                userdata.guest_data
+            )
+            return "succeeded"
+
+        cropped_rgb_image = self._crop_image(yolo_response.detected_objects, self._rgb_image)
+
+        recognise_request = Recognise3D.Request()
+        recognise_request.image_raw = cropped_rgb_image
+        recognise_request.depth_image = self._depth_image
+        recognise_request.depth_camera_info = self._depth_camera_info
+        recognise_request.threshold = 0.5
+        recognise_request.target_frame = "map"
+        try:
+            recognise_future = recognise.call_async(request)
+            rclpy.spin_until_future_complete(self.node, recognise_future)
+            response = recognise_future.result()
+
+            if response is None:
+                self.node.get_logger().warn("Recognise service call returned None.")
+                return "failed"
+
+            if len(response.detections) == 0:
+                self.node.get_logger().info(
+                    "No recognitions returned; falling back to _handle_no_detections."
+                )
+                named_guest_detection = self._handle_no_detections(userdata.guest_data)
+            else:
+                detection_id = response.detections[0].name
+                if userdata.guest_data[detection_id]["seating_detection"]:
+                    # We have already detected this guest in the seating area
+                    self.node.get_logger().info(
+                        f"Guest '{detection_id}' already detected; falling back."
+                    )
+                    named_guest_detection = self._handle_no_detections("YoloDetection3D service /yolo/detect3d not available"
             )
             return "failed"
 
@@ -155,10 +193,10 @@ class Recognise(RosState):
                 self._depth_image = depth_image
                 self._depth_camera_info = depth_camera_info
 
-        image_sub = message_filters.Subscriber(self._rgb_image_topic, Image)
-        depth_sub = message_filters.Subscriber(self._depth_image_topic, Image)
+        image_sub = message_filters.Subscriber(self.node, Image, self._rgb_image_topic)
+        depth_sub = message_filters.Subscriber(self.node, Image, self._depth_image_topic)
         depth_camera_info_sub = message_filters.Subscriber(
-            self._depth_info_topic, CameraInfo
+            self.node, CameraInfo, self._depth_info_topic
         )
         ts = message_filters.ApproximateTimeSynchronizer(
             [image_sub, depth_sub, depth_camera_info_sub], 10, 2.0
@@ -171,29 +209,28 @@ class Recognise(RosState):
             or self._depth_camera_info is None
         ):
 
-            rclpy.spin_once(self._node, timeout_sec=0.05)
+            rclpy.spin_once(self.node, timeout_sec=0.05)
 
-        yolo_request = YoloDetection3DRequest(
-            image_raw=self._rgb_image,
-            model="yolo11n-seg.pt",
-            depth_image=self._depth_image,
-            depth_camera_info=self._depth_camera_info,
-            filter=["person"],
-            target_frame="map",
-        )
+        yolo_request = YoloDetection3D.Request()
+        yolo_request.image_raw = self._rgb_image
+        yolo_request.model = "yolo11n-seg.pt"
+        yolo_request.depth_image = self._depth_image
+        yolo_request.depth_camera_info = self._depth_camera_info
+        yolo_request.filter = ["person"]
+        yolo_request.target_frame = "map"
 
-        yolo_future = yolo_client.call_async(yolo_request)
-        rclpy.spin_until_future_complete(self._node, yolo_future)
+        yolo_future = yolo_detection.call_async(yolo_request)
+        rclpy.spin_until_future_complete(self.node, yolo_future)
         yolo_response = yolo_future.result()
 
         # Service call failed entirely, no response to work with
         if yolo_response is None:
-            self._node.get_logger().warn("YOLO detection service call failed.")
+            self.node.get_logger().warn("YOLO detection service call failed.")
             return "failed"
 
         # Service succeeded but no people detected, fall back to undetected guest assignment
         if len(yolo_response.detected_objects) == 0:
-            self._node.get_logger().warn("No persons detected by YOLO.")
+            self.node.get_logger().warn("No persons detected by YOLO.")
             userdata.named_guest_detection = self._handle_no_detections(
                 userdata.guest_data
             )
@@ -201,24 +238,23 @@ class Recognise(RosState):
 
         cropped_rgb_image = self._crop_image(yolo_response.detected_objects, self._rgb_image)
 
-        request = Recognise3DRequest(
-            image_raw=cropped_rgb_image,
-            depth_image=self._depth_image,
-            depth_camera_info=self._depth_camera_info,
-            threshold=0.5,
-            target_frame="map",
-        )
+        recognise_request = Recognise3D.Request()
+        recognise_request.image_raw = cropped_rgb_image
+        recognise_request.depth_image = self._depth_image
+        recognise_request.depth_camera_info = self._depth_camera_info
+        recognise_request.threshold = 0.5
+        recognise_request.target_frame = "map"
         try:
-            recognise_future = recognise.call_async(request)
-            rclpy.spin_until_future_complete(self._node, recognise_future)
+            recognise_future = recognise.call_async(recognise_request)
+            rclpy.spin_until_future_complete(self.node, recognise_future)
             response = recognise_future.result()
 
             if response is None:
-                self._node.get_logger().warn("Recognise service call returned None.")
+                self.node.get_logger().warn("Recognise service call returned None.")
                 return "failed"
 
             if len(response.detections) == 0:
-                self._node.get_logger().info(
+                self.node.get_logger().info(
                     "No recognitions returned; falling back to _handle_no_detections."
                 )
                 named_guest_detection = self._handle_no_detections(userdata.guest_data)
@@ -226,7 +262,7 @@ class Recognise(RosState):
                 detection_id = response.detections[0].name
                 if userdata.guest_data[detection_id]["seating_detection"]:
                     # We have already detected this guest in the seating area
-                    self._node.get_logger().info(
+                    self.node.get_logger().info(
                         f"Guest '{detection_id}' already detected; falling back."
                     )
                     named_guest_detection = self._handle_no_detections(
@@ -237,7 +273,7 @@ class Recognise(RosState):
                     userdata.guest_data[named_guest_detection.name][
                         "seating_detection"
                     ] = True
-                    self._node.get_logger().info(
+                    self.node.get_logger().info(
                         f"Recognised guest: {named_guest_detection.name}"
                     )
 
@@ -245,7 +281,7 @@ class Recognise(RosState):
 
 
         except Exception as e:
-            self._node.get_logger().warn(f"Unable to perform recognition: {str(e)}")
+            self.node.get_logger().warn(f"Unable to perform recognition: {str(e)}")
             return "failed"
 
         return "succeeded"

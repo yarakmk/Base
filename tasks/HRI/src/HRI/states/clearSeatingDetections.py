@@ -2,7 +2,7 @@ import smach
 from smach import UserData
 
 class ClearSeatingDetections(smach.State):
-    def __init__(self, node):
+    def __init__(self):
         super().__init__(
             outcomes=["succeeded", "failed"],
             input_keys=["guest_data"],
